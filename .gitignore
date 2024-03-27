@@ -1,0 +1,7 @@
+*.kicad_prl
+sym-lib-table
+*-cache
+*-table
+*-backups
+*.FCStd1
+.env
