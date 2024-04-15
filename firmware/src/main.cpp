@@ -100,7 +100,7 @@ bool send_status_update()
   bool result = false;
   size_t sent = 0;
   buffer[0] = 0;
-  sprintf(buffer, "{\"group\": \"%s\", \"state\": \"%s\"}", electricity_group.getValue(), last_state ? "ON" : "OFF");
+  sprintf(buffer, "{\"group\": \"%s\", \"state\": \"%s\"}", electricity_group.getValue(), digitalRead(GPIO_NUM_3) == 1 ? "ON" : "OFF");
   https.stop();
   String response_code_line;
   if (https.connect(API_ENDPOINT_HOST, 443))
@@ -152,9 +152,8 @@ void loop()
   if (state != last_state)
   {
     Serial.printf("State changed to: %d\n", state);
-    if (send_status_update()) {
-      last_state = state;
-    } else {
+    last_state = state;
+    if (!send_status_update()) {
       Serial.println("Failed to send status update");
       Serial.println("Going to sleep. Then retry. Zzzz...");
       Serial.flush();
