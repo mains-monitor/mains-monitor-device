@@ -1,170 +1,131 @@
-#include <Arduino.h>
-#include <WiFiManager.h>
-#include <WiFiClientSecure.h>
+#include <string.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_event.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 
-#define WM_PASSWORD "md123456"
-#define STATUS_PRINT_INTERVAL (5000) // 5 seconds
-#define SLEEP_TIMEOUT (20000) // 20 seconds
-#define MSG_SEND_RETRY_INTERVAL (10 * 1000000) // 10 seconds
-#define WIFI_CONFIG_PORTAL_TIMEOUT (3 * 60) // 3 minutes
-#define MAX_WIFI_CONNECTION_RETRIES (3)
-#define WIFI_RECONNECT_SLEEP_TIMEOUT_BEFORE_RESET (1 * 1000000) // 1 second
+#include "config.hpp"
+#include "md_config.hpp"
+#include "md_wireless.hpp"
+#include "md_state_sender.hpp"
 
-WiFiClientSecure https;
-WiFiManagerParameter electricity_group("group", "Electricity Group", "1", 2);
+#define LED_PIN GPIO_NUM_1
+#define SENSE_PIN GPIO_NUM_3
 
-int8_t last_state = -1;
-RTC_DATA_ATTR int wifi_connection_retries = 0;
+static const char *LOG_TAG = "main";
 
-void print_wakeup_reason()
+static const uint64_t WIFI_CONNECTION_TIMEOUT_US = 30000000;  // 30 seconds
+static const uint64_t SMART_CONFIG_TIMEOUT_US = 5 * 60000000; // 5 minutes
+static const uint32_t CONFIG_BLINK_INTERVAL_MS = 300;
+static const uint32_t HTTP_RETRY_INTERVAL_MS = 10000; // 10 seconds
+static const uint32_t GO_TO_SLEEP_TIMEOUT_MS = 30000; // 30 seconds
+static const uint8_t HTTP_RETRIES_COUNT = 10;
+static const uint64_t DEEP_SLEEP_TIMEOUT = 5 * 60 * 1000000; // 5 minutes
+
+static void enter_deep_sleep_wake_on_pin(void)
 {
-  esp_sleep_wakeup_cause_t wakeup_reason;
-
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-
-  switch (wakeup_reason)
-  {
-  case ESP_SLEEP_WAKEUP_EXT0:
-    Serial.println("Wakeup caused by external signal using RTC_IO");
-    break;
-  case ESP_SLEEP_WAKEUP_EXT1:
-    Serial.println("Wakeup caused by external signal using RTC_CNTL");
-    break;
-  case ESP_SLEEP_WAKEUP_TIMER:
-    Serial.println("Wakeup caused by timer");
-    break;
-  case ESP_SLEEP_WAKEUP_TOUCHPAD:
-    Serial.println("Wakeup caused by touchpad");
-    break;
-  case ESP_SLEEP_WAKEUP_ULP:
-    Serial.println("Wakeup caused by ULP program");
-    break;
-  case ESP_SLEEP_WAKEUP_GPIO:
-    Serial.println("Wakeup caused by GPIO");
-    break;
-  default:
-    Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
-    break;
-  }
+    esp_deepsleep_gpio_wake_up_mode_t mode = gpio_get_level(SENSE_PIN) ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH;
+    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(1 << SENSE_PIN, mode));
+    esp_deep_sleep_start();
 }
 
-void enter_deep_sleep_wake_on_pin(uint8_t electricity_state)
+static void enter_deep_sleep_wake_on_timer(void)
 {
-  esp_deep_sleep_enable_gpio_wakeup(1 << GPIO_NUM_3, electricity_state ? ESP_GPIO_WAKEUP_GPIO_LOW : ESP_GPIO_WAKEUP_GPIO_HIGH);
-  esp_deep_sleep_start();
+    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIMEOUT);
+    esp_deep_sleep_start();
 }
 
-void enter_deep_sleep_wake_on_timer(uint64_t time_us)
+static void app_task(void *param)
 {
-  esp_deep_sleep(time_us);
-}
-
-void setup()
-{
-  pinMode(GPIO_NUM_3, INPUT);
-  Serial.begin(115200);
-
-  print_wakeup_reason();
-
-  Serial.println("Connecting to WiFi...");
-  WiFi.mode(WIFI_STA);
-  WiFiManager wm;
-  bool res;
-  char ssid[32];
-  sprintf(ssid, "MD_%06X", WIFI_getChipId());
-  wm.addParameter(&electricity_group);
-  wm.setConfigPortalTimeout(180);
-  res = wm.autoConnect(ssid, WM_PASSWORD);
-  if (!res)
-  {
-    Serial.println("Failed to connect to WiFi and hit timeout.");
-    Serial.flush();
-    if (wifi_connection_retries >= MAX_WIFI_CONNECTION_RETRIES)
+    static uint8_t retries = 0;
+    ESP_LOGI(LOG_TAG, "App task started. Waiting for WiFi connection.");
+    while (retries < HTTP_RETRIES_COUNT)
     {
-      Serial.println("Max retries reached. Going to sleep until reset or pin change. Zzzz...");
-      Serial.flush();
-      wifi_connection_retries = 0;
-      enter_deep_sleep_wake_on_pin(digitalRead(GPIO_NUM_3));
+        md_wireless_ensure_connected();
+        ESP_LOGI(LOG_TAG, "Trying to send state to BE.");
+        bool state = !!gpio_get_level(SENSE_PIN);
+        esp_err_t err = md_state_sender_send_state(state);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(LOG_TAG, "Error sending state: %s", esp_err_to_name(err));
+            ESP_LOGI(LOG_TAG, "Retrying in 10 seconds.");
+            vTaskDelay(HTTP_RETRY_INTERVAL_MS / portTICK_PERIOD_MS);
+            if (state == false)
+            {
+                // Count retries only if there is no electricity
+                retries++;
+            }
+            continue;
+        }
+        ESP_LOGI(LOG_TAG, "State sent successfully.");
+        break;
     }
-    wifi_connection_retries++;
-    esp_deep_sleep(WIFI_RECONNECT_SLEEP_TIMEOUT_BEFORE_RESET);
-  }
-  Serial.println("Connected to WiFi");
-  https.setInsecure(); // NOT RECOMMENDED
-}
-
-char buffer[1024];
-
-bool send_status_update()
-{
-  bool result = false;
-  size_t sent = 0;
-  buffer[0] = 0;
-  sprintf(buffer, "{\"group\": \"%s\", \"state\": \"%s\"}", electricity_group.getValue(), digitalRead(GPIO_NUM_3) == 1 ? "ON" : "OFF");
-  https.stop();
-  String response_code_line;
-  if (https.connect(API_ENDPOINT_HOST, 443))
-  {
-    sent += https.print(String("POST ") + API_ENDPOINT_PATH + " HTTP/1.1\r\n");
-    sent += https.print(String("Host: ") + API_ENDPOINT_HOST + "\r\n");
-    sent += https.print(F("Content-Type: application/json\r\n"));
-    sent += https.println(F("User-Agent: ESP"));
-    sent += https.printf("Content-Length: %d\r\n", strlen(buffer));
-    sent += https.print(F("Connection: close\r\n"));
-    sent += https.print(F("\r\n"));
-    sent += https.print(buffer);
-    https.flush();
-    Serial.println("Status update sent");
-    while (https.connected())
+    if (retries > 0)
     {
-      if (!response_code_line.length())
-      {
-        response_code_line = https.readStringUntil('\n');
-        Serial.println(response_code_line);
-      }
-      https.readStringUntil('\n');
+        ESP_LOGW(LOG_TAG, "Failed to send state %d times.Going to sleep for 5 minutes", retries);
+        retries = 0;
+        enter_deep_sleep_wake_on_timer();
     }
-    auto code = response_code_line.substring(9, 12).toInt();
-    if (code >= 200 && code < 300) {
-      result = true;
+    else
+    {
+        vTaskDelay(GO_TO_SLEEP_TIMEOUT_MS / portTICK_PERIOD_MS);
     }
-  }
-  else
-  {
-    Serial.println("Failed to connect to API");
-  }
-  return result;
+    ESP_LOGI(LOG_TAG, "Going to deep sleep.");
+    enter_deep_sleep_wake_on_pin();
 }
 
-unsigned long last_status_update = 0;
-
-void loop()
+static esp_err_t configure_gpio(void)
 {
-  uint8_t state = digitalRead(GPIO_NUM_3);
-  if (millis() - last_status_update > STATUS_PRINT_INTERVAL)
-  {
-    last_status_update = millis();
-    Serial.printf("State: %d\n", state);
-    Serial.printf("Wifi ssid: %s\n", WiFi.SSID().c_str());
-    Serial.printf("Wifi RSSI: %d\n", WiFi.RSSI());
-    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
-  }
-  if (state != last_state)
-  {
-    Serial.printf("State changed to: %d\n", state);
-    last_state = state;
-    if (!send_status_update()) {
-      Serial.println("Failed to send status update");
-      Serial.println("Going to sleep. Then retry. Zzzz...");
-      Serial.flush();
-      esp_deep_sleep(MSG_SEND_RETRY_INTERVAL);
-    }
-  }
-  if (millis() > SLEEP_TIMEOUT)
-  {
-    Serial.println("Going to sleep. Zzzz...");
-    Serial.flush();
-    enter_deep_sleep_wake_on_pin(state);
-  }
-  delay(100);
+    gpio_config_t led_io_conf = {};
+    led_io_conf.intr_type = GPIO_INTR_DISABLE;
+    led_io_conf.mode = GPIO_MODE_OUTPUT;
+    led_io_conf.pin_bit_mask = (1ULL << LED_PIN);
+    led_io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    led_io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+
+    ESP_ERROR_CHECK(gpio_config(&led_io_conf));
+
+    gpio_config_t sense_io_conf = {
+        .pin_bit_mask = (1ULL << SENSE_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&sense_io_conf));
+    return ESP_OK;
+}
+
+static md_wireless_config_t wireless_config = {
+    .smart_config_key = {0},
+    .wifi_connection_timeout_us = WIFI_CONNECTION_TIMEOUT_US,
+    .smart_config_timeout_us = SMART_CONFIG_TIMEOUT_US,
+    .config_blink_interval_ms = CONFIG_BLINK_INTERVAL_MS,
+    .led_gpio = LED_PIN,
+    .sense_gpio = SENSE_PIN,
+};
+
+extern "C" void app_main()
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(configure_gpio());
+
+    md_config_init();
+    int8_t smart_config_key[17] = MD_SMARTCONFIG_KEY;
+    bzero(wireless_config.smart_config_key, 17);
+    memcpy(wireless_config.smart_config_key, smart_config_key, 16);
+    md_wireless_init(&wireless_config);
+    md_state_sender_init();
+
+    xTaskCreate(app_task, "app_task", 4096, NULL, 3, NULL);
 }
